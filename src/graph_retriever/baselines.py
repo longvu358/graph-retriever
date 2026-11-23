@@ -101,7 +101,8 @@ def run_srgnn(prep: Prepared, seed: int, max_epochs: int, patience: int) -> tupl
 
     model.load_state_dict(best_state)
     scores = predict(test)
-    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history}
+    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history,
+                    "_val_scores": predict(val)}
 
 
 def _global_graph(sessions: list[list[int]], n_node: int, sample_num: int) -> tuple[list, list]:
@@ -181,7 +182,8 @@ def run_gcegnn(prep: Prepared, seed: int, max_epochs: int, patience: int) -> tup
 
     model.load_state_dict(best_state)
     scores = predict(test_ds)
-    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history}
+    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history,
+                    "_val_scores": predict(val_ds)}
 
 
 def run_dhcn(prep: Prepared, seed: int, max_epochs: int, patience: int) -> tuple[np.ndarray, dict]:
@@ -237,7 +239,8 @@ def run_dhcn(prep: Prepared, seed: int, max_epochs: int, patience: int) -> tuple
 
     model.load_state_dict(best_state)
     scores = predict(test)
-    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history}
+    return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history,
+                    "_val_scores": predict(val)}
 
 
 GRU4REC_DIR = THIRD_PARTY / "GRU4Rec_PyTorch_Official"  # official PyTorch port by Hidasi
@@ -354,6 +357,7 @@ def run_gru4rec(prep: Prepared, seed: int, max_epochs: int, patience: int) -> tu
     gru.model.load_state_dict(best_state)
     scores = _gru4rec_scores(gru, prep.test, prep.n_items, device)
     return scores, {"best_epoch": best_epoch, "best_val_recall": best_val, "history": history,
+                    "_val_scores": _gru4rec_scores(gru, prep.val, prep.n_items, device),
                     "hyperparams": {"layers": gru.layers, "loss": gru.loss, "batch_size": gru.batch_size,
                                     "learning_rate": gru.learning_rate, "n_sample": gru.n_sample,
                                     "sample_alpha": gru.sample_alpha, "elu_param": gru.elu_param}}
@@ -371,13 +375,19 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("results/scores"))
     ap.add_argument("--max-epochs", type=int, default=50)
     ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--save-val", action="store_true", help="also write {stem}_val.npy")
     args = ap.parse_args()
 
     prep = prepare(load_city(Path(args.raw), args.city))
     scores, info = RUNNERS[args.model](prep, args.seed, args.max_epochs, args.patience)
     args.out.mkdir(parents=True, exist_ok=True)
     stem = f"{args.model}_{args.city}_seed{args.seed}"
+    val_scores = info.pop("_val_scores")
     np.save(args.out / f"{stem}.npy", scores.astype(np.float32))
+    if args.save_val:  # plan D6: val scores of the selected epoch, for val-side selection
+        if val_scores.shape[0] != len(prep.val):
+            raise RuntimeError(f"{stem}: val scores {val_scores.shape}, expected {len(prep.val)} rows")
+        np.save(args.out / f"{stem}_val.npy", val_scores.astype(np.float32))
     (args.out / f"{stem}.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     print(f"{stem}: best_epoch={info['best_epoch']} val_R@20={info['best_val_recall']:.4f}", flush=True)
 

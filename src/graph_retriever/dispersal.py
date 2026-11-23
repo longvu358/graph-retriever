@@ -175,3 +175,239 @@ def rank_mmr(
         chosen.append(c)
         max_sim = np.maximum(max_sim, sim[c])
     return chosen
+
+
+# --- Pool-level rankers (plans C4, C5). `rel` is a full-length (N,) vector in which every
+# item outside the candidate pool is NEG_REL, so the rankers only see the pool. ---
+
+NEG_REL = -1e9
+POOL_FLOOR = -1e8  # rel above this value is inside the pool
+
+
+def pool_mask(rel: np.ndarray) -> np.ndarray:
+    return rel > POOL_FLOOR
+
+
+def aspect_dist_uniform(aspects: list[frozenset], pool: np.ndarray) -> dict:
+    """P(a|q) uniform over the aspects that occur in the pool."""
+    present = sorted({a for i in np.flatnonzero(pool) for a in aspects[i]})
+    return {a: 1.0 / len(present) for a in present} if present else {}
+
+
+def aspect_dist_prefix(aspects: list[frozenset], pool: np.ndarray, prefix: list[int]) -> dict:
+    """P(a|q) from the prefix: Laplace-smoothed counts of prefix items per aspect, over the
+    aspects that occur in the pool. Prefix aspects missing from the pool get no mass."""
+    present = sorted({a for i in np.flatnonzero(pool) for a in aspects[i]})
+    if not present:
+        return {}
+    counts = {a: 1.0 for a in present}  # Laplace
+    for v in prefix:
+        for a in aspects[v]:
+            if a in counts:
+                counts[a] += 1.0
+    total = sum(counts.values())
+    return {a: c / total for a, c in counts.items()}
+
+
+def rank_xquad(
+    rel: np.ndarray,
+    k: int,
+    aspects: list[frozenset],
+    p_aspect: dict,
+    lam: float,
+) -> list[int]:
+    """xQuAD (Santos et al. 2010) over the pool, uniform P(c|a) = 1 / |pool ∩ a|.
+
+    score(c | S) = (1 - lam) * P(c|q) + lam * sum_a P(a|q) P(c|a) prod_{j in S} (1 - P(j|a))
+    P(c|q) is the softmax of `rel` over the pool. Items without any aspect only get the
+    relevance term.
+    """
+    pool = pool_mask(rel)
+    idx = np.flatnonzero(pool)
+    z = rel[idx] - rel[idx].max()
+    p_rel = np.exp(z) / np.exp(z).sum()
+    n_a: dict = {}
+    for i in idx:
+        for a in aspects[i]:
+            n_a[a] = n_a.get(a, 0) + 1
+    m_a: dict = {a: 0 for a in n_a}  # selected items per aspect
+    chosen: list[int] = []
+    taken = np.zeros(rel.shape[0], dtype=bool)
+    for _ in range(min(k, idx.size)):
+        best, best_score = -1, -np.inf
+        for pos, c in enumerate(idx):
+            if taken[c]:
+                continue
+            div = 0.0
+            for a in aspects[c]:
+                if a not in p_aspect:
+                    continue
+                inv = 1.0 / n_a[a]
+                div += p_aspect[a] * inv * (1.0 - inv) ** m_a[a]
+            score = (1.0 - lam) * p_rel[pos] + lam * div
+            if score > best_score:
+                best, best_score = int(c), score
+        chosen.append(best)
+        taken[best] = True
+        for a in aspects[best]:
+            if a in m_a:
+                m_a[a] += 1
+    return chosen
+
+
+def rank_prefix_subst(
+    rel: np.ndarray,
+    k: int,
+    prefix: list[int],
+    pop: np.ndarray,
+    is_head: np.ndarray,
+    share: np.ndarray,
+    gamma: float,
+    mode: str,
+) -> list[int]:
+    """Prefix-anchored substitution (plan C5).
+
+    H = head POIs in the prefix. A candidate c is boosted when c is a tail POI not in the
+    prefix and shares a hyperedge (area or theme) with some h in H.
+      mode "binary": score = rel + gamma * 1[boost]
+      mode "gap":    score = rel + gamma * max_{h in H, share(h,c)} (pop[h] - pop[c]) on boosted c
+    With H empty the ranking is the plain top-k by rel.
+    """
+    if mode not in ("binary", "gap"):
+        raise ValueError(mode)
+    heads = sorted({v for v in prefix if is_head[v]})
+    if not heads:
+        s = rel.copy()
+    else:
+        in_prefix = np.zeros(rel.shape[0], dtype=bool)
+        in_prefix[list(prefix)] = True
+        share_h = share[:, heads]  # (N, |H|)
+        boosted = (~is_head) & (~in_prefix) & share_h.any(axis=1)
+        if mode == "binary":
+            bonus = boosted.astype(np.float64)
+        else:
+            gap = np.where(share_h, pop[heads][None, :] - pop[:, None], -np.inf).max(axis=1)
+            bonus = np.where(boosted, np.maximum(gap, 0.0), 0.0)
+        s = rel + gamma * bonus
+    return np.argsort(-s, kind="stable")[:k].tolist()
+
+
+# --- Clean in-list swap (plan D2): no lambda, no coverage. ---
+
+SWAP_CHANNELS = ("theme", "area", "both", "union", "category")
+
+
+def channel_masks(hg: Hypergraph, category: np.ndarray) -> dict[str, np.ndarray]:
+    """(N, N) bool substitution masks per channel, zero diagonal.
+
+    theme: share >= 1 theme; area: same area; both: same area and share a theme;
+    union: share_matrix (area or theme); category: same flat category (hypergraph.flat_category).
+    """
+    n = hg.n_items
+    theme = np.zeros((n, n), dtype=bool)
+    by_theme: dict[str, list[int]] = {}
+    for node, names in hg.theme_edges.items():
+        for name in names:
+            by_theme.setdefault(name, []).append(node)
+    for members in by_theme.values():
+        idx = np.array(members)
+        theme[np.ix_(idx, idx)] = True
+    area = (hg.area[:, None] == hg.area[None, :]) & (hg.area[:, None] >= 0)
+    cat = (category[:, None] == category[None, :]) & (category[:, None] >= 0)
+    out = {"theme": theme, "area": area, "both": theme & area, "union": share_matrix(hg),
+           "category": cat}
+    for m in out.values():
+        np.fill_diagonal(m, False)
+    return out
+
+
+def pop_threshold(pop: np.ndarray, frac: float) -> float:
+    """pop value of the ceil(frac * N)-th most popular POI: pop >= threshold is the top frac."""
+    order = np.sort(pop)[::-1]
+    return float(order[max(1, int(np.ceil(frac * pop.shape[0]))) - 1])
+
+
+def swap_sequence(
+    rel: np.ndarray,
+    pop: np.ndarray,
+    sub: np.ndarray,
+    k: int,
+    tau: float,
+    delta: float,
+    budget: int,
+    select: str = "rel",
+    bonus: np.ndarray | None = None,
+    rng: np.random.Generator | None = None,
+) -> list[tuple[int, int, float]]:
+    """Swaps applied to the top-k of a pool, in local pool coordinates.
+
+    `rel`, `pop`, `bonus` are (P,) over the pool, sorted by rel descending (position 0..k-1
+    is the starting list); `sub` is the (P, P) pool block of the substitution mask.
+    Heads of the starting list with pop >= tau are visited by pop descending (ties: list
+    position). Candidates of u: not in the current list, pop < pop(u), sub[u, v],
+    rel(v) >= rel(u) - delta. Returns (position, v, pop(u)) per swap, at most `budget`.
+    A visited head without candidates costs no budget and draws no random number, so a
+    run with a lower tau or budget is a prefix of this sequence.
+    """
+    if select not in ("rel", "rel+session", "random"):
+        raise ValueError(select)
+    k = min(k, rel.shape[0])
+    in_list = np.zeros(rel.shape[0], dtype=bool)
+    in_list[:k] = True
+    score = rel if bonus is None or select != "rel+session" else rel + bonus
+    heads = [p for p in range(k) if pop[p] >= tau]
+    heads.sort(key=lambda p: (-pop[p], p))
+    out: list[tuple[int, int, float]] = []
+    for u in heads:
+        if len(out) >= budget:
+            break
+        ok = sub[u] & ~in_list & (pop < pop[u]) & (rel >= rel[u] - delta)
+        if not ok.any():
+            continue
+        cand = np.flatnonzero(ok)
+        if select == "random":
+            v = int(cand[rng.integers(cand.size)])
+        else:
+            v = int(cand[np.argmax(score[cand])])
+        in_list[u] = False
+        in_list[v] = True
+        out.append((u, v, float(pop[u])))
+    return out
+
+
+def rank_swap(
+    rel: np.ndarray,
+    k: int,
+    pop: np.ndarray,
+    pool: np.ndarray,
+    sub_mask: np.ndarray,
+    tau: float,
+    delta: float,
+    budget: int,
+    select: str = "rel",
+    w: float = 0.0,
+    prefix_edges: set | None = None,
+    rng: np.random.Generator | None = None,
+    item_edges: list | None = None,
+) -> tuple[list[int], int]:
+    """Clean swap reranker (plan D2). Start from the top-k of `pool` by `rel`; no lambda and
+    no coverage. Each head u (pop(u) >= tau, a pop value, see pop_threshold) of the list is
+    replaced in place by one candidate v (see swap_sequence), at most `budget` swaps.
+
+    select "rel": max rel(v). "rel+session": max rel(v) + w * |edges(v) ∩ prefix_edges|,
+    edges from `item_edges` (per-item set of theme/area keys). "random": uniform over the
+    candidates with `rng` (the D2 control, used with a long-tail-only `sub_mask`).
+    `rel`, `pop` are (N,), `sub_mask` (N, N), `pool` item ids. Returns (list, number of swaps).
+    """
+    pool = np.asarray(pool)
+    order = pool[np.argsort(-rel[pool], kind="stable")]
+    bonus = None
+    if select == "rel+session":
+        pe = prefix_edges or set()
+        bonus = w * np.array([len(item_edges[i] & pe) for i in order], dtype=np.float64)
+    seq = swap_sequence(rel[order], pop[order], sub_mask[np.ix_(order, order)], k, tau, delta,
+                        budget, select, bonus, rng)
+    lst = order[:k].copy()
+    for pos, v, _ in seq:
+        lst[pos] = order[v]
+    return lst.tolist(), len(seq)

@@ -167,3 +167,129 @@ def alpha_ndcg(
     if ideal <= 0.0:
         return 0.0
     return _alpha_dcg(ranking[:k], relevant, alpha) / ideal
+
+
+# --- Exposure dispersal over a whole split (plan D0) ---
+
+
+def exposure_vector(lists: np.ndarray, n_items: int) -> np.ndarray:
+    """(N,) exposure: sum over queries of 1/log2(r + 1) for the item at rank r = 1..K.
+
+    Items that never appear get 0. N is every POI of the city, not only the pool.
+    """
+    lists = np.asarray(lists)
+    disc = 1.0 / np.log2(np.arange(lists.shape[1]) + 2)
+    return np.bincount(lists.ravel(), weights=np.tile(disc, lists.shape[0]), minlength=n_items)
+
+
+def exposure_stats(exposure: np.ndarray, is_head: np.ndarray) -> dict[str, float]:
+    """Gini, normalised entropy, top-1% share and head share of an exposure vector."""
+    n = exposure.shape[0]
+    total = exposure.sum()
+    p = exposure / total
+    nz = p[p > 0]
+    top = max(1, int(0.01 * n))
+    return {
+        "exp_gini": gini(exposure),
+        "exp_entropy": float(-(nz * np.log(nz)).sum() / math.log(n)),
+        "exp_top1pct": float(np.sort(p)[::-1][:top].sum()),
+        "exp_head_share": float(p[is_head].sum()),
+    }
+
+
+def exposure_metrics(lists: np.ndarray, n_items: int, is_head: np.ndarray) -> dict[str, float]:
+    return exposure_stats(exposure_vector(lists, n_items), is_head)
+
+
+# --- Rank- and relevance-aware novelty (Vargas & Castells 2011, as used by Lacic et al. 2020) ---
+#
+# Both metrics follow Lacic et al. (UMUAI 2020, Sect. 4.4):
+#   EPC@k = 1/|S| sum_s 1/|R_k|         sum_i disc(i) p(rel|R_i,s) (1 - p(seen|R_i))
+#   EPD@k = 1/|S| sum_s 1/(|R_k||H_s|)  sum_i sum_j disc(i) p(rel|R_i,s) d(R_i, H_j)
+# with disc(i) = 1/log2(i + 1), p(seen|i) = log2(pop_i + 1) / log2(pop_max + 1).
+# p(rel) is 1 only for the target here (one target per query), so the relevance-aware form
+# scores the target alone. `rel_aware=False` sets p(rel) = 1 for every list item: that form
+# measures the whole list. Report both.
+
+
+def _disc(k: int) -> np.ndarray:
+    return 1.0 / np.log2(np.arange(1, k + 1) + 1)
+
+
+def p_seen(pop_count: np.ndarray) -> np.ndarray:
+    """(N,) log2(pop + 1) / log2(pop_max + 1), train counts. All zero if pop_max = 0."""
+    top = math.log2(float(pop_count.max()) + 1.0)
+    if top == 0.0:
+        return np.zeros(pop_count.shape[0])
+    return np.log2(pop_count.astype(np.float64) + 1.0) / top
+
+
+def _rel_weight(lists: np.ndarray, targets: np.ndarray | None) -> np.ndarray:
+    if targets is None:
+        return np.ones(lists.shape, dtype=np.float64)
+    return (lists == np.asarray(targets)[:, None]).astype(np.float64)
+
+
+def epc(lists: np.ndarray, pop_count: np.ndarray, targets: np.ndarray | None = None) -> float:
+    """EPC@k over (Q, k) lists. targets=None gives the relevance-unaware form (p(rel) = 1)."""
+    lists = np.asarray(lists)
+    k = lists.shape[1]
+    nov = 1.0 - p_seen(pop_count)
+    per_q = (_disc(k)[None, :] * _rel_weight(lists, targets) * nov[lists]).sum(axis=1) / k
+    return float(per_q.mean())
+
+
+def cosine_distance_matrix(sessions: list[list[int]], n_items: int) -> np.ndarray:
+    """(N, N) 1 - cosine over binary item x session vectors (item in session or not).
+
+    An item with no session (zero vector) gets distance 1 to every other item and 0 to itself.
+    """
+    rows, cols = [], []
+    for s_id, s in enumerate(sessions):
+        for v in set(s):
+            rows.append(v)
+            cols.append(s_id)
+    m = np.zeros((n_items, len(sessions)), dtype=np.float64)
+    m[rows, cols] = 1.0
+    co = m @ m.T
+    norm = np.sqrt(np.diag(co))
+    denom = np.outer(norm, norm)
+    sim = np.divide(co, denom, out=np.zeros_like(co), where=denom > 0)
+    d = 1.0 - sim
+    np.fill_diagonal(d, 0.0)
+    return d
+
+
+def history_distance(dist: np.ndarray, prefixes: list[list[int]]) -> np.ndarray:
+    """(Q, N) float32: row q = mean over the prefix items h of dist[:, h] (1/|H_s| sum_j d)."""
+    out = np.empty((len(prefixes), dist.shape[0]), dtype=np.float32)
+    for q, p in enumerate(prefixes):
+        out[q] = dist[:, p].mean(axis=1)
+    return out
+
+
+def epd(lists: np.ndarray, hist: np.ndarray, targets: np.ndarray | None = None) -> float:
+    """EPD@k over (Q, k) lists; hist from history_distance. targets=None: p(rel) = 1."""
+    lists = np.asarray(lists)
+    k = lists.shape[1]
+    d = np.take_along_axis(hist, lists, axis=1).astype(np.float64)
+    per_q = (_disc(k)[None, :] * _rel_weight(lists, targets) * d).sum(axis=1) / k
+    return float(per_q.mean())
+
+
+def ild_batch(lists: np.ndarray, sim: np.ndarray) -> float:
+    """Mean over lists of the mean pairwise (1 - sim) inside the list. Same as `ild` with
+    Jaccard when sim = jaccard_similarity_matrix."""
+    lists = np.asarray(lists)
+    k = lists.shape[1]
+    if k < 2:
+        return 0.0
+    d = 1.0 - sim[lists[:, :, None], lists[:, None, :]]
+    return float((d.sum(axis=(1, 2)) / (k * (k - 1))).mean())
+
+
+def self_information(lists: np.ndarray, pop_count: np.ndarray) -> float:
+    """novelty_pop for a (Q, k) array."""
+    n = pop_count.shape[0]
+    nov = -np.log2((pop_count + 1.0) / (pop_count.sum() + n))
+    return float(nov[np.asarray(lists)].mean())

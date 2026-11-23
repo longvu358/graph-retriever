@@ -24,6 +24,9 @@ ACCURACY_BUDGET = 0.01  # max absolute Recall@20 loss on val, relative to lambda
 ILD_BUDGET = 0.02  # used only by the ILD-constrained rule: max ILD loss on val vs lambda = 0
 CITIES = ("pisa", "florence", "rome")
 REPORT = ("recall", "ndcg", "ILD", "coverage", "long_tail_ratio", "ARP")
+# Pool-level rows (plans C4, C5) also carry these; read only when present.
+POOL_METRICS = ("tail_hit", "recall_hp", "tail_hit_hp")
+CRITERIA = ("coverage", "tail_hit")  # R1: coverage (as tune_v2); R2: long-tail Hit@20
 
 
 def _load(tune_dir: Path, city: str) -> list[dict]:
@@ -39,12 +42,17 @@ def _mean_std(vals: list[float]) -> str:
     return f"{a.mean():.3f} ± {a.std():.3f}"
 
 
-def select(rows: list[dict], ild_constrained: bool = False) -> list[tuple[str, float, dict]]:
-    """Return [(method, lambda, {split: {metric: [per-seed values]}})] for each chosen setting."""
+def select(rows: list[dict], ild_constrained: bool = False,
+           criterion: str = "coverage") -> list[tuple[str, float, dict]]:
+    """Return [(method, lambda, {split: {metric: [per-seed values]}})] for each chosen setting.
+
+    `criterion` is the val metric maximised among feasible lambdas (and across methods)."""
+    if criterion not in CRITERIA:
+        raise ValueError(criterion)
     by_key: dict[tuple[str, str, float], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
         key = (r["split"], r["method"], float(r["lam"]))
-        for m in ("recall", "coverage", "ndcg", "ILD", "long_tail_ratio", "ARP"):
+        for m in ("recall", "coverage", "ndcg", "ILD", "long_tail_ratio", "ARP") + POOL_METRICS:
             if r.get(m) not in ("", None):
                 by_key[key][m].append(float(r[m]))
 
@@ -66,12 +74,13 @@ def select(rows: list[dict], ild_constrained: bool = False) -> list[tuple[str, f
         ]
         if not feasible:
             continue
-        best_lam = max(feasible, key=lambda l: mean("val", method, l, "coverage"))
-        chosen.append((method, best_lam, mean("val", method, best_lam, "coverage")))
+        best_lam = max(feasible, key=lambda l: mean("val", method, l, criterion))
+        chosen.append((method, best_lam, mean("val", method, best_lam, criterion)))
 
     out = []
     for method, lam, _ in sorted(chosen, key=lambda x: -x[2]):
-        report = {split: {m: by_key[(split, method, lam)][m] for m in REPORT} for split in ("val", "test")}
+        report = {split: {m: by_key[(split, method, lam)][m] for m in REPORT + POOL_METRICS}
+                  for split in ("val", "test")}
         out.append((method, lam, report))
     return out
 
@@ -110,3 +119,27 @@ def main(tune_dir: Path, out_path: Path) -> None:
 
 if __name__ == "__main__":
     main(Path(sys.argv[1]), Path(sys.argv[2]))
+
+
+def render_rows(rows: list[dict], label: str, criterion: str = "coverage") -> str:
+    """Markdown table of the selected setting per method, from pool-level rows (plans C4, C5)."""
+    chosen = select(rows, criterion=criterion)
+    lines = [
+        f"### {label} (K=20, pool top-100, val-selected by val {criterion}, budget={ACCURACY_BUDGET})",
+        "",
+        "| method | λ | val R@20 | val " + criterion + " | test R@20 | test nDCG | test long-tail Hit@20 | "
+        "test coverage | test long-tail ratio | test ILD | test ARP | test R@20 (head in prefix) | "
+        "test long-tail Hit@20 (head in prefix) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for method, lam, rep in chosen:
+        t = rep["test"]
+        lines.append(
+            f"| {method} | {lam} | {_mean_std(rep['val']['recall'])} | "
+            f"{_mean_std(rep['val'][criterion])} | {_mean_std(t['recall'])} | {_mean_std(t['ndcg'])} | "
+            f"{_mean_std(t['tail_hit'])} | {_mean_std(t['coverage'])} | {_mean_std(t['long_tail_ratio'])} | "
+            f"{_mean_std(t['ILD'])} | {_mean_std(t['ARP'])} | {_mean_std(t['recall_hp'])} | "
+            f"{_mean_std(t['tail_hit_hp'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)

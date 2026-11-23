@@ -56,7 +56,13 @@ class Hypergraph:
         return self.area.shape[0]
 
 
-def _theme_edges(city: City, node_ids: list[str]) -> dict[str, list[int]]:
+def _theme_edges(
+    city: City, node_ids: list[str], max_frac: float = THEME_MAX_FRAC, min_size: int = 2,
+    split_by: np.ndarray | None = None,
+) -> dict[str, list[int]]:
+    """Theme hyperedges. A theme covering more than max_frac of the nodes is dropped, or, when
+    split_by (an (N,) area label per node) is given, cut into one edge per area (plan D9):
+    'chiese' becomes 'chiese@a3', 'chiese@a7', ... each kept if it has >= min_size members."""
     members: dict[str, set[int]] = {}
     for i, cid in enumerate(node_ids):
         for raw in city.clusters[cid].categories:
@@ -66,10 +72,17 @@ def _theme_edges(city: City, node_ids: list[str]) -> dict[str, list[int]]:
     n = len(node_ids)
     kept: dict[str, list[int]] = {}
     for name, mem in members.items():
-        if len(mem) < 2:
+        if len(mem) < min_size:
             continue  # size-1 edges connect nothing
-        if len(mem) / n > THEME_MAX_FRAC:
-            continue  # too broad to be informative
+        if len(mem) / n > max_frac:
+            if split_by is not None:  # too broad: keep it only inside each area
+                parts: dict[int, list[int]] = {}
+                for i in mem:
+                    parts.setdefault(int(split_by[i]), []).append(i)
+                for lab, sub in parts.items():
+                    if len(sub) >= min_size:
+                        kept[f"{name}@a{lab}"] = sorted(sub)
+            continue  # too broad to be informative as one edge
         kept[name] = sorted(mem)
     return kept
 
@@ -83,14 +96,16 @@ def _haversine_matrix(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-def _area_labels(city: City, node_ids: list[str]) -> np.ndarray:
+def _area_labels(
+    city: City, node_ids: list[str], diameter_km: float = AREA_DIAMETER_KM,
+) -> np.ndarray:
     lat = np.array([city.clusters[c].lat for c in node_ids])
     lon = np.array([city.clusters[c].lon for c in node_ids])
     dist = _haversine_matrix(lat, lon)
     model = AgglomerativeClustering(
         metric="precomputed",
         linkage="complete",
-        distance_threshold=AREA_DIAMETER_KM,
+        distance_threshold=diameter_km,
         n_clusters=None,
     )
     return model.fit_predict(dist)
@@ -132,25 +147,32 @@ def build_hypergraph(
     city: City,
     prep: Prepared,
     channels: tuple[str, ...] = CHANNELS,
+    theme_max_frac: float = THEME_MAX_FRAC,
+    area_diameter_km: float = AREA_DIAMETER_KM,
+    min_edge_size: int = 2,
+    theme_split_area: bool = False,
 ) -> Hypergraph:
+    """min_edge_size applies to theme and area edges (prune ablation); defaults are v2.
+    theme_split_area (plan D9): broad themes are split by area instead of dropped."""
     node_ids = prep.node_ids
     n = len(node_ids)
     edges: dict[str, list[EdgeInfo]] = {}
     H: dict[str, np.ndarray] = {}
     operators: dict[str, np.ndarray] = {}
 
-    theme = _theme_edges(city, node_ids)
+    labels = _area_labels(city, node_ids, area_diameter_km)
+    theme = _theme_edges(city, node_ids, theme_max_frac, min_edge_size,
+                         split_by=labels if theme_split_area else None)
     theme_edges: dict[int, list[str]] = {i: [] for i in range(n)}
     for name, mem in theme.items():
         for i in mem:
             theme_edges[i].append(name)
 
-    labels = _area_labels(city, node_ids)
     area = np.full(n, -1, dtype=np.int64)
     area_edges: list[EdgeInfo] = []
     for lab in np.unique(labels):
         mem = np.flatnonzero(labels == lab)
-        if len(mem) < 2:
+        if len(mem) < min_edge_size:
             continue
         area[mem] = len(area_edges)
         area_edges.append(EdgeInfo("area", f"area_{len(area_edges)}", tuple(mem.tolist())))
@@ -195,3 +217,26 @@ def graph_stats(hg: Hypergraph) -> dict:
             "nodes_covered": int((hg.H[ch].sum(axis=1) > 0).sum()),
         }
     return out
+
+
+def flat_category(city: City, node_ids: list[str]) -> tuple[np.ndarray, list[str]]:
+    """Flat POI type (plan D1 control). TripBuilder raw has no coarse type field, so each
+    node gets its broadest Wikipedia category: the normalised category token shared by the
+    most nodes, including tokens that THEME_MAX_FRAC drops from Theme. District tags are
+    excluded as in Theme (they duplicate Area). Ties break by name. Nodes without any
+    category get -1 (they match nothing).
+    Returns (N,) category id and the id -> name list.
+    """
+    tokens = [
+        sorted({t for t in (normalize_theme(r) for r in city.clusters[c].categories) if t})
+        for c in node_ids
+    ]
+    size: dict[str, int] = {}
+    for ts in tokens:
+        for t in ts:
+            size[t] = size.get(t, 0) + 1
+    chosen = [min(ts, key=lambda t: (-size[t], t)) if ts else None for ts in tokens]
+    names = sorted({t for t in chosen if t is not None})
+    ids = {t: i for i, t in enumerate(names)}
+    cat = np.array([ids[t] if t is not None else -1 for t in chosen], dtype=np.int64)
+    return cat, names

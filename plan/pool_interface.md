@@ -6,7 +6,7 @@ Phạm vi: phần của Long (retriever + pool ứng viên). Phần LLM reranker
 
 | Thành phần | Quyết định | Căn cứ |
 |---|---|---|
-| Retriever | GRU trên prefix + kênh theme và area (hypergraph, không có kênh session) | v2: vượt SR-GNN/GCE-GNN/DHCN ở Florence và Rome, không rò rỉ target |
+| Retriever | GRU trên prefix + kênh theme và area (hypergraph, không có kênh session) | v2: vượt SR-GNN/GCE-GNN/DHCN ở Florence và Rome, không rò rỉ target *(lỗi thời: Recall ngang GCE-GNN và DHCN; chỉ vượt SR-GNN ở Florence và Rome, xem `plan/report_comparison.md`)* |
 | Đầu vào retriever | Prefix cluster ids + bucket thời gian của điểm cuối prefix | v3: thêm session edge và ngữ cảnh thời gian không cải thiện đáng kể |
 | Huấn luyện | CE trên mọi item, early stop theo val R@20, không SSL | v4: SSL hai view không cải thiện |
 | Pool | Top-100 lưu đầy đủ; reranker dùng N=50 mặc định | Xem mục 2 |
@@ -34,7 +34,9 @@ So sánh pool plain với pool penalty (λ=0.25, λ=1) ở N=20:
 - Recall gần như không đổi (Rome: 0.752 → 0.751 với λ=1).
 - Số category giảm nhẹ với λ=1 (Rome: 58.7 → 55.3; Pisa: 17.2 → 17.0).
 
-Kết luận: penalty trong pool không đem lại đa dạng đáng kể. Đa dạng cần đến từ reranker. Pool giữ dạng plain, reranker quyết định việc đa dạng hoá.
+Kết luận: penalty trong pool không đem lại đa dạng đáng kể. Đa dạng cần đến từ reranker. Pool giữ dạng plain, reranker quyết định việc đa dạng hoá. *(lỗi thời với coverage, xem sửa bên dưới)*
+
+> **Sửa (2026-11-18, C4, `results/c4_xquad/table.md`):** Kết luận trên chỉ đúng với số category trung bình. Với coverage (tỉ lệ item được gợi ý ít nhất một lần, pool top-100, test): Pisa 0.500 → 0.670 (λ = 1), Florence 0.526 → 0.581 (λ = 1), Rome 0.672 → 0.728 (λ = 2). Recall@20 giảm không đáng kể (Pisa 0.830 → 0.831 tại λ = 1). Penalty là lever dispersal chính; đây là đối chứng mà reranker LLM phải vượt cùng với MMR và xQuAD.
 
 ## 4. Căn cứ bên ngoài
 

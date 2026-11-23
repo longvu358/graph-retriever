@@ -34,6 +34,7 @@ def export(city: str, raw_root: Path, seed: int, out: Path, tcfg: TrainConfig) -
     model, info = train_model(prep, hg, tcfg, seed, learn_gate=True)
     rel = score_matrix(model, prep.test)
     np.save(out / f"{stem}.npy", rel.astype(np.float32))
+    np.save(out / f"{stem}_val.npy", score_matrix(model, prep.val).astype(np.float32))
     meta = {"city": city, "seed": seed, "config": "v2_none_gru", "channels": list(CHANNELS),
             "best_epoch": info["best_epoch"], "val_recall": info["best_val_recall"],
             "n_test": int(rel.shape[0])}

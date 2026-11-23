@@ -43,13 +43,17 @@ Bảng sinh tự động bởi `graph_retriever.compare` từ các CSV trong `re
 
 ## Đọc kết quả
 
-**Độ chính xác.** HGNN v2 (GRU + theme + area) ngang GCE-GNN và DHCN về Recall@20 ở cả ba thành phố (chênh lệch ≤ 0.014). Vượt SR-GNN ở mọi thành phố (+0.017 Pisa, +0.088 Florence, +0.043 Rome), và vượt Markov và Popularity.
+**Độ chính xác.** HGNN v2 (GRU + theme + area) ngang GCE-GNN và DHCN về Recall@20 ở cả ba thành phố (chênh lệch ≤ 0.014). Vượt SR-GNN ở mọi thành phố (+0.017 Pisa, +0.088 Florence, +0.043 Rome), và vượt Markov và Popularity. *(lỗi thời, xem sửa bên dưới)*
+
+> **Sửa (2026-11-18, theo A2 và C0):** Recall@20 của v2 ngang GCE-GNN và DHCN, không cặp nào có ý nghĩa sau Holm (Florence seed 0 vs GCE-GNN thấp hơn 0.010, p Holm = 0.08). So với SR-GNN, chỉ Florence và Rome có ý nghĩa (3/3 seed ở Florence, Rome 3/3 seed có ý nghĩa); Pisa (+0.017) không có ý nghĩa sau Holm. nDCG@20 của v2 cao hơn GCE-GNN, DHCN và SR-GNN có ý nghĩa ở cả ba thành phố và mọi seed. So với GRU4Rec (C0: Pisa 0.8160, Florence 0.4417, Rome 0.6934), nDCG không nhất quán. Nguồn: `results_remote/a2_significance/summary.md`.
 
 **Chất lượng xếp hạng (nDCG@20).** Đây là điểm mạnh nhất của v2: cao nhất ở Pisa (0.491 so với 0.423–0.458 của các baseline neural) và Florence (0.248 so với 0.190–0.237). Ở Rome, v2 ngang GRU thuần và GCE-GNN (0.411 so với 0.410 và 0.394). Lợi thế nDCG cho thấy item đúng được xếp cao hơn, không chỉ nằm trong top-20.
 
 **Đa dạng và phủ (ILD, coverage, long-tail).** v2 không mạnh về phủ: coverage 0.50 / 0.53 / 0.67 so với GCE-GNN và DHCN (0.75–0.98). ILD gần như bằng nhau giữa các model (0.92–0.94). Tức là retriever không tạo đa dạng đáng kể; việc này được giao cho reranker LLM (xem `plan/pool_interface.md`).
 
-**Đóng góp của đồ thị.** So với GRU không đồ thị, kênh theme + area tăng Recall@20 +0.024 (Pisa), +0.017 (Florence), +0.006 (Rome). nDCG tăng +0.038 ở Pisa, +0.004 ở Florence, 0 ở Rome. Đóng góp rõ nhất ở Pisa, nhưng Pisa là dataset nhỏ nhất (110 cluster). Cần nêu rõ đây là đóng góp nhỏ.
+**Đóng góp của đồ thị.** So với GRU không đồ thị, kênh theme + area tăng Recall@20 +0.024 (Pisa), +0.017 (Florence), +0.006 (Rome). nDCG tăng +0.038 ở Pisa, +0.004 ở Florence, 0 ở Rome. Đóng góp rõ nhất ở Pisa, nhưng Pisa là dataset nhỏ nhất (110 cluster). Cần nêu rõ đây là đóng góp nhỏ. *(lỗi thời, xem sửa bên dưới)*
+
+> **Sửa (2026-11-18, theo A2):** Recall@20 so với GRU không đồ thị có ý nghĩa sau Holm ở Florence (3/3 seed), không có ý nghĩa ở Pisa (0/3), và 1/3 seed ở Rome. nDCG@20 có ý nghĩa ở Pisa (3/3) và Florence (2/3). Vì vậy đóng góp không nhất quán giữa các thành phố: rõ ràng nhất ở Florence về Recall, và ở Pisa về nDCG. Không nên viết "rõ nhất ở Pisa".
 
 ## Caveat khi báo cáo
 

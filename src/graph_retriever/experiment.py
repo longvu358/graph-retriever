@@ -123,6 +123,7 @@ def run_city(city_name: str, raw_root: Path, seeds: list[int], tcfg: TrainConfig
                 "best_epoch": info["best_epoch"],
                 "val_recall": info["best_val_recall"],
                 "gate": ",".join(f"{g:.3f}" for g in model.gate().tolist()),
+                "n_edges": ",".join(f"{c}={hg.H[c].shape[1]}" for c in hg.channels),
             }
             rows += plain_rows(city_name, seed, name, None, rel, prep, targets, area, cats, extra)
             print(f"[{city_name}] seed={seed} {name}: best_epoch={info['best_epoch']} "
@@ -249,6 +250,17 @@ V4_CONFIGS = (
 )
 
 
+PRUNE_CONFIGS = (
+    # one factor at a time around v2 (theme_max_frac=0.05, area 0.5 km, min edge size 2)
+    ("prune_ref", ("theme", "area"), "gru", True, False, False, 0.0, {}),
+    ("prune_theme02", ("theme", "area"), "gru", True, False, False, 0.0, {"theme_max_frac": 0.02}),
+    ("prune_theme10", ("theme", "area"), "gru", True, False, False, 0.0, {"theme_max_frac": 0.10}),
+    ("prune_area025", ("theme", "area"), "gru", True, False, False, 0.0, {"area_diameter_km": 0.25}),
+    ("prune_area10", ("theme", "area"), "gru", True, False, False, 0.0, {"area_diameter_km": 1.0}),
+    ("prune_min3", ("theme", "area"), "gru", True, False, False, 0.0, {"min_edge_size": 3}),
+)
+
+
 def run_v2(
     city_name: str, raw_root: Path, seeds: list[int], tcfg: TrainConfig,
     only: list[str] | None = None, configs_all: tuple = V2_CONFIGS,
@@ -264,7 +276,8 @@ def run_v2(
     for seed in seeds:
         for name, chans, encoder, residual, sedge, tctx, *extra_fields in configs:
             ssl_beta = extra_fields[0] if extra_fields else 0.0
-            hg = build_hypergraph(city, prep, chans)
+            hg_kwargs = extra_fields[1] if len(extra_fields) > 1 else {}
+            hg = build_hypergraph(city, prep, chans, **hg_kwargs)
             cfg = dc_replace(tcfg, encoder=encoder, residual=residual,
                              session_edge=sedge, time_ctx=tctx, ssl_beta=ssl_beta)
             model, info = train_model(prep, hg, cfg, seed, learn_gate=True)
@@ -274,6 +287,7 @@ def run_v2(
                 "best_epoch": info["best_epoch"],
                 "val_recall": info["best_val_recall"],
                 "gate": ",".join(f"{g:.3f}" for g in model.gate().tolist()),
+                "n_edges": ",".join(f"{c}={hg.H[c].shape[1]}" for c in hg.channels),
             }
             rows += plain_rows(city_name, seed, name, None, rel, prep, targets, hg.area, cats, extra)
             print(f"[{city_name}] seed={seed} {name}: best_epoch={info['best_epoch']} "
@@ -343,6 +357,8 @@ def main() -> None:
     ap.add_argument("--scores", type=Path, default=Path("results/scores"))
     ap.add_argument("--v2-only", nargs="*", default=None,
                     help="run only these v2 config names (e.g. v2_none_gru)")
+    ap.add_argument("--prune", action="store_true",
+                    help="hypergraph pruning sweep (theme max frac, area diameter, min edge size)")
     ap.add_argument("--v4", action="store_true",
                     help="two-view InfoNCE (DHCN-style) with beta in {0, 0.01, 0.1}")
     ap.add_argument("--v3", action="store_true",
@@ -354,6 +370,16 @@ def main() -> None:
     ap.add_argument("--tune", action="store_true",
                     help="sweep dispersal grids on val and test for one seed per process")
     args = ap.parse_args()
+
+    if args.prune:
+        tcfg = TrainConfig(max_epochs=args.max_epochs)
+        for c in args.cities:
+            rows = run_v2(c, args.raw, args.seeds, tcfg, only=args.v2_only,
+                          configs_all=PRUNE_CONFIGS)
+            name = f"{c}_only" if args.v2_only else c
+            write_csv(rows, args.out / "prune" / f"{name}.csv")
+            print(f"[{c}] wrote {len(rows)} prune rows", flush=True)
+        return
 
     if args.v4:
         tcfg = TrainConfig(max_epochs=args.max_epochs)

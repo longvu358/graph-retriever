@@ -28,6 +28,7 @@ from graph_retriever.train import TrainConfig, score_matrix, train_model
 
 POOL_MAX = 100
 POOL_SIZES = (10, 20, 50, 100)
+DEEP_POOL_SIZES = (10, 20, 50, 100, 200, 300)  # report sizes allowed by --pool-max
 PENALTY_LAMBDAS = (0.25, 1.0)  # dispersal-aware pools, reported alongside the plain pool
 RETRIEVER_CHANNELS = ("theme", "area")
 
@@ -49,20 +50,23 @@ def _pool_stats(items: np.ndarray, targets: np.ndarray, area: np.ndarray,
     }
 
 
-def export_pool(city_name: str, raw_root: Path, seed: int, out: Path, tcfg: TrainConfig) -> dict:
+def export_pool(city_name: str, raw_root: Path, seed: int, out: Path, tcfg: TrainConfig,
+                pool_max: int = POOL_MAX, theme_split_area: bool = False) -> dict:
     city = load_city(raw_root, city_name)
     prep = prepare(city)
     cats = category_sets(city, prep.node_ids)
-    hg = build_hypergraph(city, prep, RETRIEVER_CHANNELS)
+    hg = build_hypergraph(city, prep, RETRIEVER_CHANNELS, theme_split_area=theme_split_area)
     model, info = train_model(prep, hg, tcfg, seed, learn_gate=True)
 
     report: dict = {"city": city_name, "seed": seed, "best_epoch": info["best_epoch"],
-                    "val_recall_model": info["best_val_recall"], "splits": {}}
+                    "val_recall_model": info["best_val_recall"], "pool_max": pool_max,
+                    "splits": {}}
+    sizes = [n for n in DEEP_POOL_SIZES if n <= pool_max]
     out.mkdir(parents=True, exist_ok=True)
     for split, samples in (("val", prep.val), ("test", prep.test)):
         rel = score_matrix(model, samples)
         targets = np.array([s.target for s in samples])
-        items = np.argsort(-rel, axis=1, kind="stable")[:, :POOL_MAX]
+        items = np.argsort(-rel, axis=1, kind="stable")[:, :pool_max]
         rel_top = np.take_along_axis(rel, items, axis=1)
         np.savez_compressed(out / f"{city_name}_seed{seed}_{split}.npz",
                             items=items.astype(np.int32), rel=rel_top.astype(np.float32),
@@ -70,11 +74,11 @@ def export_pool(city_name: str, raw_root: Path, seed: int, out: Path, tcfg: Trai
                             prefix_last=np.array([s.prefix[-1] for s in samples], dtype=np.int32),
                             ctx=np.array([s.ctx for s in samples], dtype=np.int8))
         split_report: dict = {"plain": {str(n): _pool_stats(items, targets, hg.area, cats, n)
-                                        for n in POOL_SIZES}}
+                                        for n in sizes}}
         for lam in PENALTY_LAMBDAS:
-            pen = np.stack([rank_penalty(rel[i], prep.pop, lam, POOL_MAX) for i in range(len(samples))])
+            pen = np.stack([rank_penalty(rel[i], prep.pop, lam, pool_max) for i in range(len(samples))])
             split_report[f"penalty_{lam}"] = {str(n): _pool_stats(pen, targets, hg.area, cats, n)
-                                              for n in POOL_SIZES}
+                                              for n in sizes}
         report["splits"][split] = split_report
     return report
 
@@ -130,6 +134,17 @@ def main() -> None:
     ap.add_argument("--candidates", action="store_true",
                     help="write reranker input JSONL from existing pool .npz files (no training)")
     ap.add_argument("--n", type=int, default=CANDIDATE_LIST_SIZE)
+    ap.add_argument("--pool-max", type=int, default=POOL_MAX,
+                    help="store the top-P candidates per query (default 100; C2 uses 300)")
+    ap.add_argument("--logq-tau", type=float, default=0.0,
+                    help="plan D6: logit adjustment strength during training (0 = v2)")
+    ap.add_argument("--future-gamma", type=float, default=0.0,
+                    help="plan D8: weight decay of later visits as extra targets (0 = v2)")
+    ap.add_argument("--future-horizon", type=int, default=3)
+    ap.add_argument("--disp-beta", type=float, default=0.0,
+                    help="plan D8: batch dispersion regulariser weight (0 = v2)")
+    ap.add_argument("--theme-split-area", action="store_true",
+                    help="plan D9: split broad themes by area instead of dropping them")
     args = ap.parse_args()
 
     if args.candidates:
@@ -144,10 +159,13 @@ def main() -> None:
                     print(f"[{c}] seed={seed} {split}: {count} queries -> {out}", flush=True)
         return
 
-    tcfg = TrainConfig(encoder="gru", residual=True, max_epochs=args.max_epochs)
+    tcfg = TrainConfig(encoder="gru", residual=True, max_epochs=args.max_epochs,
+                       logq_tau=args.logq_tau, future_gamma=args.future_gamma,
+                       future_horizon=args.future_horizon, disp_beta=args.disp_beta)
     for c in args.cities:
         for seed in args.seeds:
-            rep = export_pool(c, args.raw, seed, args.out, tcfg)
+            rep = export_pool(c, args.raw, seed, args.out, tcfg, pool_max=args.pool_max,
+                              theme_split_area=args.theme_split_area)
             (args.out / f"{c}_seed{seed}_report.json").write_text(
                 json.dumps(rep, indent=2), encoding="utf-8")
             print(f"[{c}] seed={seed} exported pool (val R@20 model={rep['val_recall_model']:.4f})",

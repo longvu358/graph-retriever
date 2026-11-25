@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
@@ -233,6 +234,36 @@ V2_CONFIGS = (
     ("v2_none_gru", (), "gru", True, False, False),  # control: GRU on plain embeddings
 )
 
+RNN_CONFIGS = (
+    # session encoder ablation: GRU (v2 reference) vs LSTM vs LRU, with and without graph
+    ("rnn_theme_area_gru", ("theme", "area"), "gru", True, False, False),
+    ("rnn_theme_area_lstm", ("theme", "area"), "lstm", True, False, False),
+    ("rnn_theme_area_lru", ("theme", "area"), "lru", True, False, False),
+    ("rnn_none_gru", (), "gru", True, False, False),
+    ("rnn_none_lstm", (), "lstm", True, False, False),
+    ("rnn_none_lru", (), "lru", True, False, False),
+)
+
+
+def _lru_tune_configs() -> tuple:
+    """LRU quick tune: r_min x max_phase x lr, with and without graph. Select on val only.
+
+    The 9th field holds TrainConfig overrides (after ssl_beta and hypergraph kwargs).
+    r0_p2pi_lr1e-3 is the default LRU of RNN_CONFIGS (consistency check).
+    """
+    out = []
+    for chans, tag in ((("theme", "area"), "theme_area"), ((), "none")):
+        for r_min in (0.0, 0.5, 0.9):
+            for phase, ptag in ((2 * math.pi, "2pi"), (math.pi / 10, "pi10")):
+                for lr, ltag in ((1e-3, "1e-3"), (3e-4, "3e-4")):
+                    name = f"lrutune_{tag}_r{r_min:g}_p{ptag}_lr{ltag}"
+                    over = {"lru_r_min": r_min, "lru_max_phase": phase, "lr": lr}
+                    out.append((name, chans, "lru", True, False, False, 0.0, {}, over))
+    return tuple(out)
+
+
+LRU_TUNE_CONFIGS = _lru_tune_configs()
+
 V3_CONFIGS = (
     # step 1: one hyperedge over the prefix (leak-free); step 2: time-of-day/weekend context
     ("v3_ref_gru", ("theme", "area"), "gru", True, False, False),
@@ -277,9 +308,10 @@ def run_v2(
         for name, chans, encoder, residual, sedge, tctx, *extra_fields in configs:
             ssl_beta = extra_fields[0] if extra_fields else 0.0
             hg_kwargs = extra_fields[1] if len(extra_fields) > 1 else {}
+            cfg_over = extra_fields[2] if len(extra_fields) > 2 else {}
             hg = build_hypergraph(city, prep, chans, **hg_kwargs)
             cfg = dc_replace(tcfg, encoder=encoder, residual=residual,
-                             session_edge=sedge, time_ctx=tctx, ssl_beta=ssl_beta)
+                             session_edge=sedge, time_ctx=tctx, ssl_beta=ssl_beta, **cfg_over)
             model, info = train_model(prep, hg, cfg, seed, learn_gate=True)
             rel = score_matrix(model, prep.test)
             targets = np.array([s.target for s in prep.test])
@@ -361,6 +393,10 @@ def main() -> None:
                     help="hypergraph pruning sweep (theme max frac, area diameter, min edge size)")
     ap.add_argument("--v4", action="store_true",
                     help="two-view InfoNCE (DHCN-style) with beta in {0, 0.01, 0.1}")
+    ap.add_argument("--rnn", action="store_true",
+                    help="session encoder ablation: GRU vs LSTM vs LRU (theme+area and no graph)")
+    ap.add_argument("--lru-tune", action="store_true",
+                    help="LRU quick tune: r_min x max_phase x lr grid (select on val)")
     ap.add_argument("--v3", action="store_true",
                     help="run step-1/step-2 variants (prefix session edge, time context)")
     ap.add_argument("--v2", action="store_true",
@@ -388,6 +424,18 @@ def main() -> None:
             name = f"{c}_only" if args.v2_only else c
             write_csv(rows, args.out / "v4" / f"{name}.csv")
             print(f"[{c}] wrote {len(rows)} v4 rows", flush=True)
+        return
+
+    if args.rnn or args.lru_tune:
+        sub, configs = ("lru_tune", LRU_TUNE_CONFIGS) if args.lru_tune else ("rnn", RNN_CONFIGS)
+        tcfg = TrainConfig(max_epochs=args.max_epochs)
+        for c in args.cities:
+            rows = run_v2(c, args.raw, args.seeds, tcfg, only=args.v2_only, configs_all=configs)
+            name = f"{c}_only" if args.v2_only else c
+            if args.lru_tune:  # one process per (city, seed) runs in parallel
+                name += "_seed" + "-".join(map(str, args.seeds))
+            write_csv(rows, args.out / sub / f"{name}.csv")
+            print(f"[{c}] wrote {len(rows)} {sub} rows", flush=True)
         return
 
     if args.v3:

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from graph_retriever.model import HGRetriever
@@ -20,6 +21,40 @@ def test_gru_encoder_ignores_right_padding():
         a = model(short, short_mask)
         b = model(padded, padded_mask)
     assert torch.allclose(a, b, atol=1e-6)
+
+
+@pytest.mark.parametrize("encoder", ["lstm", "lru"])
+def test_lstm_lru_encoders_ignore_right_padding(encoder):
+    model = _model(encoder)
+    short = torch.tensor([[1, 2, 3]])
+    short_mask = torch.tensor([[True, True, True]])
+    padded = torch.tensor([[1, 2, 3, 0, 0]])
+    padded_mask = torch.tensor([[True, True, True, False, False]])
+    with torch.no_grad():
+        a = model(short, short_mask)
+        b = model(padded, padded_mask)
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+@pytest.mark.parametrize("encoder", ["lstm", "lru"])
+def test_lstm_lru_encoders_are_order_aware_and_train(encoder):
+    model = _model(encoder).train()
+    mask = torch.tensor([[True, True, True]])
+    with torch.no_grad():
+        model.eval()
+        a = model(torch.tensor([[1, 2, 3]]), mask)
+        b = model(torch.tensor([[3, 2, 1]]), mask)
+    assert not torch.allclose(a, b)
+    model.train()
+    loss = torch.nn.functional.cross_entropy(model(torch.tensor([[1, 2, 3]]), mask), torch.tensor([4]))
+    loss.backward()
+    grads = [p.grad for n, p in model.named_parameters() if encoder in n]
+    assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
+
+
+def test_unknown_encoder_raises():
+    with pytest.raises(ValueError):
+        HGRetriever(6, {}, dim=8, encoder="rnn")
 
 
 def test_attn_encoder_ignores_right_padding():

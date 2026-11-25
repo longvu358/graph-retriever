@@ -1,6 +1,8 @@
 """GRU (no graph) test scores for A2 and A4: the `v2_none_gru` control, exported like pool.py.
+`--encoder lstm|lru` exports the same no-graph control with another recurrent encoder,
+under the stem `{encoder}_...` (gru keeps the original `gru_...` names).
 
-Writes `{out}/gru_{city}_seed{s}.npy` (float32, (n_test, N), prep.test order, same as the
+Writes `{out}/{encoder}_{city}_seed{s}.npy` (float32, (n_test, N), prep.test order, same as the
 baseline score files) and a `.json` with the run info. Existing files are never overwritten.
 
 Usage (on the server, inside tmux, after choosing a free GPU):
@@ -25,7 +27,7 @@ CHANNELS: tuple[str, ...] = ()  # v2_none_gru: plain GRU embeddings, no hyperedg
 
 
 def export(city: str, raw_root: Path, seed: int, out: Path, tcfg: TrainConfig) -> str:
-    stem = f"gru_{city}_seed{seed}"
+    stem = f"{tcfg.encoder}_{city}_seed{seed}"
     if (out / f"{stem}.npy").exists():
         return f"[{city}] seed={seed}: {stem}.npy exists, skipped"
     data = load_city(raw_root, city)
@@ -35,7 +37,8 @@ def export(city: str, raw_root: Path, seed: int, out: Path, tcfg: TrainConfig) -
     rel = score_matrix(model, prep.test)
     np.save(out / f"{stem}.npy", rel.astype(np.float32))
     np.save(out / f"{stem}_val.npy", score_matrix(model, prep.val).astype(np.float32))
-    meta = {"city": city, "seed": seed, "config": "v2_none_gru", "channels": list(CHANNELS),
+    meta = {"city": city, "seed": seed, "config": f"v2_none_{tcfg.encoder}",
+            "encoder": tcfg.encoder, "channels": list(CHANNELS),
             "best_epoch": info["best_epoch"], "val_recall": info["best_val_recall"],
             "n_test": int(rel.shape[0])}
     (out / f"{stem}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -49,10 +52,11 @@ def main() -> None:
     ap.add_argument("--cities", nargs="+", default=list(CITIES), choices=CITIES)
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--max-epochs", type=int, default=50)
+    ap.add_argument("--encoder", default="gru", choices=("gru", "lstm", "lru"))
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    tcfg = TrainConfig(encoder="gru", residual=True, max_epochs=args.max_epochs)
+    tcfg = TrainConfig(encoder=args.encoder, residual=True, max_epochs=args.max_epochs)
     for city in args.cities:
         for seed in args.seeds:
             print(export(city, args.raw, seed, args.out, tcfg), flush=True)

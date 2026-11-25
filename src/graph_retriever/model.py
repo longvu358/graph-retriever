@@ -1,11 +1,79 @@
 """HGNN retriever: per-channel hypergraph convolution, learned channel gate,
-session encoder (attention pooling or order-aware GRU), softmax over all items."""
+session encoder (attention pooling or an order-aware recurrent encoder: GRU, LSTM or LRU),
+softmax over all items."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+ENCODERS = ("attn", "gru", "lstm", "lru")
+
+
+class LRU(nn.Module):
+    """Linear Recurrent Unit (Orvieto et al., 2023), diagonal complex recurrence:
+
+        h_t = lambda * h_{t-1} + gamma * (B x_t),  y_t = Re(C h_t) + D * x_t,
+        lambda = exp(-exp(nu_log) + i exp(theta_log)),  gamma = sqrt(1 - |lambda|^2).
+
+    Complex numbers are kept as (real, imag) pairs. The scan runs step by step, which is
+    cheap for short sessions and causal, so right padding never changes earlier outputs.
+    """
+
+    def __init__(self, dim: int, state: int | None = None, r_min: float = 0.0,
+                 r_max: float = 1.0, max_phase: float = 2 * math.pi) -> None:
+        super().__init__()
+        n = state or dim
+        u1, u2 = torch.rand(n), torch.rand(n)
+        # |lambda| uniform on the ring [r_min, r_max], phase uniform on [0, max_phase]
+        nu_log = torch.log(-0.5 * torch.log(u1 * (r_max**2 - r_min**2) + r_min**2))
+        theta_log = torch.log(max_phase * u2)
+        self.nu_log = nn.Parameter(nu_log)
+        self.theta_log = nn.Parameter(theta_log)
+        mod = torch.exp(-torch.exp(nu_log))
+        self.gamma_log = nn.Parameter(torch.log(torch.sqrt(1 - mod**2)))
+        self.B_re = nn.Parameter(torch.randn(n, dim) / math.sqrt(2 * dim))
+        self.B_im = nn.Parameter(torch.randn(n, dim) / math.sqrt(2 * dim))
+        self.C_re = nn.Parameter(torch.randn(dim, n) / math.sqrt(n))
+        self.C_im = nn.Parameter(torch.randn(dim, n) / math.sqrt(n))
+        self.D = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, d) -> (B, L, d)."""
+        mod = torch.exp(-torch.exp(self.nu_log))
+        phase = torch.exp(self.theta_log)
+        lam_re, lam_im = mod * torch.cos(phase), mod * torch.sin(phase)
+        gamma = torch.exp(self.gamma_log)
+        bu_re = gamma * (x @ self.B_re.T)  # (B, L, n)
+        bu_im = gamma * (x @ self.B_im.T)
+        h_re = x.new_zeros(x.shape[0], self.nu_log.shape[0])
+        h_im = torch.zeros_like(h_re)
+        states_re, states_im = [], []
+        for t in range(x.shape[1]):
+            h_re, h_im = (lam_re * h_re - lam_im * h_im + bu_re[:, t],
+                          lam_re * h_im + lam_im * h_re + bu_im[:, t])
+            states_re.append(h_re)
+            states_im.append(h_im)
+        H_re = torch.stack(states_re, dim=1)
+        H_im = torch.stack(states_im, dim=1)
+        return H_re @ self.C_re.T - H_im @ self.C_im.T + self.D * x
+
+
+class LRUBlock(nn.Module):
+    """LRU block as in the paper: x + GLU(GELU(LRU(LayerNorm(x))))."""
+
+    def __init__(self, dim: int, **lru_init: float) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.lru = LRU(dim, **lru_init)
+        self.glu = nn.Linear(dim, 2 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.gelu(self.lru(self.norm(x)))
+        return x + F.glu(self.glu(y), dim=-1)
 
 
 class HGRetriever(nn.Module):
@@ -22,9 +90,10 @@ class HGRetriever(nn.Module):
         session_edge: bool = False,
         n_time: int = 0,
         clique_op: torch.Tensor | None = None,
+        lru_init: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
-        if encoder not in ("attn", "gru"):
+        if encoder not in ENCODERS:
             raise ValueError(f"unknown encoder: {encoder}")
         self.channels = tuple(operators)
         self.dropout = dropout
@@ -50,8 +119,12 @@ class HGRetriever(nn.Module):
             self.register_buffer("gate_logits", torch.zeros(n_ch))
         if encoder == "attn":
             self.att = nn.Linear(dim, 1)
-        else:
+        elif encoder == "gru":
             self.gru = nn.GRU(dim, dim, batch_first=True)
+        elif encoder == "lstm":
+            self.lstm = nn.LSTM(dim, dim, batch_first=True)
+        else:
+            self.lru = LRUBlock(dim, **(lru_init or {}))
         self.time_emb = None
         if n_time > 0:
             self.time_emb = nn.Embedding(n_time, dim)
@@ -115,7 +188,13 @@ class HGRetriever(nn.Module):
             logits = self.att(h).squeeze(-1).masked_fill(~mask, float("-inf"))
             a = torch.softmax(logits, dim=1)
             return (a.unsqueeze(-1) * h).sum(dim=1)
-        out, _ = self.gru(h)  # right padding does not affect states before it
+        # recurrent encoders are causal: right padding does not affect states before it
+        if self.encoder == "gru":
+            out, _ = self.gru(h)
+        elif self.encoder == "lstm":
+            out, _ = self.lstm(h)
+        else:
+            out = self.lru(h)
         last = mask.sum(dim=1) - 1
         return out[torch.arange(h.shape[0], device=h.device), last]
 

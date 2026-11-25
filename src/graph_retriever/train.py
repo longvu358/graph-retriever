@@ -29,6 +29,10 @@ class TrainConfig:
     eval_k: int = 20
     encoder: str = "attn"
     residual: bool = False
+    # LRU encoder init (Orvieto et al., 2023): |lambda| on [r_min, r_max], phase on [0, max_phase]
+    lru_r_min: float = 0.0
+    lru_r_max: float = 1.0
+    lru_max_phase: float = 6.283185307179586
     session_edge: bool = False  # add a one-edge hyperedge over the prefix (leak-free)
     time_ctx: bool = False  # add a learned embedding of the last prefix visit's time bucket
     ssl_beta: float = 0.0  # weight of the two-view InfoNCE loss (0 = off)
@@ -148,6 +152,7 @@ def train_model(
         session_edge=cfg.session_edge,
         n_time=N_TIME_BUCKETS if cfg.time_ctx else 0,
         clique_op=clique if cfg.ssl_beta > 0 else None,
+        lru_init={"r_min": cfg.lru_r_min, "r_max": cfg.lru_r_max, "max_phase": cfg.lru_max_phase},
     ).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     val_targets = np.array([s.target for s in prep.val])
